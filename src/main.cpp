@@ -36,6 +36,17 @@
  *
  * NOTES:
  * - avformat_open_input() can open up network streams as well...
+ *
+ * Acknowledgments & references:
+ *
+ * Thanks to piponazo (piponazo@plagatux.es) for writing an article on how to
+ * inject and read metadata with MPEG2-TS using FFMPEG.
+ * http://plagatux.es/2011/07/using-libav-library/
+ *
+ * Thanks to Stephen Dranger (dranger@gmail.com) for writing probably the only
+ * more well-known tutorial for FFMPEG.
+ * http://dranger.com/ffmpeg/
+ * https://github.com/mpenkov/ffmpeg-tutorial
  */
 
 #include <getopt.h>
@@ -46,6 +57,7 @@
 #include <log4cpp/Category.hh>
 #include <log4cpp/FileAppender.hh>
 #include <log4cpp/OstreamAppender.hh>
+#include <chrono>
 
 extern "C" {
 #include "libavcodec/avcodec.h"
@@ -73,13 +85,18 @@ static log4cpp::Category& logger = log4cpp::Category::getRoot();
  * @return timestamp as uint64_t, ms since Unix Epoch
  */
 uint64_t inject_timestamp_callback() {
-    return 0;
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
 }
 
+// for some reason FFMPEG devs are returning arrays that go out of scope immediately
+// so using this as a workaround
 #define ts2str(ts) av_ts_make_string(new char[AV_TS_MAX_STRING_SIZE], ts)
 #define ts2timestr(ts, tb) av_ts_make_time_string(new char[AV_TS_MAX_STRING_SIZE], ts, tb)
 
-
+/**
+ * Logs packet info to console
+ */
 static void log_packet(const AVFormatContext *fmt_ctx, const AVPacket *pkt, const char *tag) {
     AVRational* time_base = &fmt_ctx->streams[pkt->stream_index]->time_base;
 
@@ -117,18 +134,38 @@ void usage() {
     printf("-o, --output <string>     output stream. Required.\n");
 }
 
+/**
+ * Converts a uint64_t(long) to a byte array (uint8_t[4]) in BIG-ENDIAN
+ *
+ * @param val the val to convert
+ * @param buf pointer pointing to array of bytes (uint8_t), must be at least 4
+ *            bytes long
+ */
+static void uint64_to_bytes(uint64_t val, uint8_t* buf) {
+    buf[0]= (int)((val >> 56) & 0xFF);
+    buf[1]= (int)((val >> 48) & 0xFF);
+    buf[2]= (int)((val >> 40) & 0xFF);
+    buf[3]= (int)((val >> 32) & 0xFF);
+    buf[4]= (int)((val >> 24) & 0xFF);
+    buf[5]= (int)((val >> 16) & 0xFF);
+    buf[6]= (int)((val >> 8) & 0xFF);
+    buf[7]= (int)(val & 0xFF);
+}
+
 int main (int argc, char **argv) {
     // INPUT
     AVFormatContext*        input_fmt_ctx = NULL;   // Input Format context
     int                     input_vid_stream_idx;
+
     // OUTPUT
     AVOutputFormat*         output_fmt = NULL;      // output format
     AVFormatContext*        output_fmt_ctx = NULL;  // output format context
-
-    AVFilterGraph*          filter_graph = NULL;
-
-    AVBitStreamFilter*      h264_mp4toannexb_filter = NULL;
+    AVStream*               output_data_stream = NULL; // output data stream (timestamp)
     AVBitStreamFilterContext* h264_mp4toannexb_filter_ctx = NULL;
+
+    // output metadata
+    int                     output_data_buf_size = 8; // storing 64 bit timestamp
+    uint8_t*                output_data_buf = NULL;
 
     AVPacket                pkt;                    // Packet received by AV
     int                     ret;                    // General return val
@@ -262,6 +299,30 @@ int main (int argc, char **argv) {
             input_vid_stream_idx = i;
     }
 
+
+
+    logger.debug("Setting up output data stream...");
+    // create data stream and add it to the MPEG2-TS output format context
+    output_data_stream = avformat_new_stream(output_fmt_ctx, 0);
+    AVCodecContext* output_data_codec_ctx = output_data_stream->codec;
+    AVCodec* output_data_codec = avcodec_find_encoder(AV_CODEC_ID_SMPTE_KLV);
+    avcodec_get_context_defaults3(output_data_codec_ctx, output_data_codec);
+
+    // is this necessary if we do the abouve avcodec_get_context_defaults3 call?
+    output_data_codec_ctx->codec_type = AVMEDIA_TYPE_DATA;
+    output_data_codec_ctx->codec_id = AV_CODEC_ID_SMPTE_KLV;
+    // output_data_codec_ctx->codec_id = AV_CODEC_ID_SMPTE_KLV;
+    //TODO This should be set to incoming video framerate I guess
+    output_data_codec_ctx->time_base = (AVRational){1,25};  // should be inverse of framerate
+
+    // create data buf
+    output_data_buf = new uint8_t[output_data_buf_size] {0};
+    // output_data_buf = (uint8_t*)av_malloc(output_data_buf_size);
+
+    if(output_fmt_ctx->oformat->flags & AVFMT_GLOBALHEADER) {
+        output_data_stream->codec->flags |= CODEC_FLAG_GLOBAL_HEADER;
+    }
+
     // dump output information to stderr
     av_dump_format(output_fmt_ctx, 0, output.c_str(), 1);
 
@@ -332,6 +393,37 @@ int main (int argc, char **argv) {
 
             logger.debug("Writing filtered frame...");
             ret = av_interleaved_write_frame(output_fmt_ctx, &filtered_pkt);
+
+            if(ret < 0) {
+                logger.error("Error muxing packet");
+                break;
+            }
+
+            // write data frame
+            int64_t pts = pkt.pts;
+            av_init_packet(&pkt);
+            pkt.pts = av_rescale_q_rnd(pts, in_stream->time_base, output_data_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX));
+            // pkt.pts = av_rescale_q_rnd(pts, in_stream->time_base, output_data_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX));
+            // pkt.dts = av_rescale_q_rnd(pkt.dts, in_stream->time_base, out_stream->time_base, (AVRounding)(AV_ROUND_NEAR_INF|AV_ROUND_PASS_MINMAX));
+            pkt.flags |= AV_PKT_FLAG_KEY;
+            pkt.stream_index = output_data_stream->index;
+
+            // call inject timestamp callback and store result into data buf
+            uint64_to_bytes(inject_timestamp_callback(), output_data_buf);
+            pkt.data = output_data_buf;
+            pkt.size = output_data_buf_size;
+
+            log_packet(output_fmt_ctx, &pkt, "out data");
+            logger.debug("Writing data frame... pkt.size = %d", pkt.size);
+            ret = av_interleaved_write_frame(output_fmt_ctx, &pkt);
+            if(ret < 0) {
+                logger.error("Error muxing packet");
+                break;
+            }
+
+            // av_free_packet(&pkt);
+
+
         } else {
             // else
             // write write frame to output_fmt_ctx without filtering
@@ -344,6 +436,7 @@ int main (int argc, char **argv) {
             break;
         }
         av_free_packet(&pkt);
+
         frame_ctr++;
     }
     av_write_trailer(output_fmt_ctx);
@@ -356,9 +449,6 @@ int main (int argc, char **argv) {
     logger.debug("processed %ld frames", frame_ctr);
     // printf("read %d data packets\n", data_pkt_cnt);
     // printf("read %d unkown packets\n", unkown_pkt_cnt);
-    // data_dump_file.close();
-    // avcodec_close(vid_dec_ctx);
-    // avcodec_close(data_dec_ctx);
 //    av_frame_free(&frame);
     avformat_close_input(&input_fmt_ctx);
     /* close output */
@@ -372,5 +462,8 @@ int main (int argc, char **argv) {
     }
     if(h264_mp4toannexb_filter_ctx)
         av_bitstream_filter_close(h264_mp4toannexb_filter_ctx);
+    avcodec_close(output_data_codec_ctx);
+    delete output_data_buf;
+
     return 0;
 }

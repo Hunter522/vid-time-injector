@@ -44,6 +44,7 @@ target_link_libraries(vid-time-injector avutil)
 target_link_libraries(vid-time-injector postproc)
 target_link_libraries(vid-time-injector swresample)
 target_link_libraries(vid-time-injector swscale)
+target_link_libraries(vid-time-injector pthread)
 # target_link_libraries(vid-time-injector z) # zlib
 # target_link_libraries(vid-time-injector m) # math
 target_link_libraries(vid-time-injector ${LOG4CPP_LIBRARIES})
